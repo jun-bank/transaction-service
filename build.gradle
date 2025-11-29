@@ -28,13 +28,13 @@ dependencies {
     // Spring Boot Core
     // ========================================
     // 웹 애플리케이션 (REST API)
-    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-webmvc'
     // Bean Validation (요청 데이터 검증)
     implementation 'org.springframework.boot:spring-boot-starter-validation'
     // Actuator (헬스체크, 메트릭, 모니터링 엔드포인트)
     implementation 'org.springframework.boot:spring-boot-starter-actuator'
-    // AOP (Resilience4j 어노테이션, 멱등성 AOP에 필요)
-    implementation 'org.springframework.boot:spring-boot-starter-aop'
+    // AOP (Resilience4j 어노테이션, 분산 락 AOP에 필요)
+    implementation 'org.springframework.boot:spring-boot-starter-aspectj'
 
     // ========================================
     // Spring Cloud - MSA 인프라
@@ -112,6 +112,8 @@ dependencies {
     // ========================================
     // Spring Boot Test (JUnit 5, MockMvc, TestRestTemplate 등)
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    // WebMVC Test (MockMvc, Spring Boot 4.0 모듈화)
+    testImplementation 'org.springframework.boot:spring-boot-starter-webmvc-test'
     // Kafka Test (EmbeddedKafka 등)
     testImplementation 'org.springframework.kafka:spring-kafka-test'
     // H2 Database (인메모리 DB, 테스트용)

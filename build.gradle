@@ -1,0 +1,148 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '4.0.0'
+    id 'io.spring.dependency-management' version '1.1.7'
+}
+
+group = 'com.junbank'
+version = '0.0.1-SNAPSHOT'
+description = 'Transaction Service - 입출금 처리 서비스 (멱등성 학습)'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+ext {
+    set('springCloudVersion', '2025.1.0')
+    set('queryDslVersion', '5.1.0')
+}
+
+dependencies {
+    // ========================================
+    // Spring Boot Core
+    // ========================================
+    // 웹 애플리케이션 (REST API)
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    // Bean Validation (요청 데이터 검증)
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+    // Actuator (헬스체크, 메트릭, 모니터링 엔드포인트)
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    // AOP (Resilience4j 어노테이션, 멱등성 AOP에 필요)
+    implementation 'org.springframework.boot:spring-boot-starter-aop'
+
+    // ========================================
+    // Spring Cloud - MSA 인프라
+    // ========================================
+    // Config Client (Config Server에서 설정 로드)
+    implementation 'org.springframework.cloud:spring-cloud-starter-config'
+    // Eureka Client (서비스 디스커버리 등록/조회)
+    implementation 'org.springframework.cloud:spring-cloud-starter-netflix-eureka-client'
+    // OpenFeign (선언적 REST 클라이언트, Account Service 호출)
+    implementation 'org.springframework.cloud:spring-cloud-starter-openfeign'
+    // LoadBalancer (클라이언트 사이드 로드밸런싱)
+    implementation 'org.springframework.cloud:spring-cloud-starter-loadbalancer'
+    // Circuit Breaker (Resilience4j 기반 장애 전파 방지)
+    implementation 'org.springframework.cloud:spring-cloud-starter-circuitbreaker-resilience4j'
+
+    // ========================================
+    // Messaging - Kafka
+    // ========================================
+    // Kafka (거래 완료 이벤트 발행, Ledger 서비스로 전달)
+    implementation 'org.springframework.kafka:spring-kafka'
+
+    // ========================================
+    // Database - PostgreSQL + JPA
+    // ========================================
+    // Spring Data JPA (ORM, Repository 추상화)
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    // PostgreSQL JDBC Driver
+    runtimeOnly 'org.postgresql:postgresql'
+
+    // ========================================
+    // QueryDSL - 타입 세이프 쿼리
+    // ========================================
+    // QueryDSL JPA (Jakarta EE 호환)
+    implementation "com.querydsl:querydsl-jpa:${queryDslVersion}:jakarta"
+    // QueryDSL APT (Q클래스 자동 생성, Jakarta EE 호환)
+    annotationProcessor "com.querydsl:querydsl-apt:${queryDslVersion}:jakarta"
+    // Jakarta Persistence API (QueryDSL APT에서 @Entity 인식용)
+    annotationProcessor 'jakarta.persistence:jakarta.persistence-api'
+    // Jakarta Annotation API (QueryDSL APT 의존성)
+    annotationProcessor 'jakarta.annotation:jakarta.annotation-api'
+
+    // ========================================
+    // Observability - 분산 추적 & 메트릭
+    // ========================================
+    // Micrometer Tracing (Brave 기반 분산 추적)
+    implementation 'io.micrometer:micrometer-tracing-bridge-brave'
+    // Zipkin Reporter (Zipkin 서버로 트레이스 전송)
+    implementation 'io.zipkin.reporter2:zipkin-reporter-brave'
+    // Prometheus Registry (메트릭 수집 및 /actuator/prometheus 노출)
+    runtimeOnly 'io.micrometer:micrometer-registry-prometheus'
+
+    // ========================================
+    // Logging - ELK 연동
+    // ========================================
+    // Logstash Logback Encoder (JSON 포맷 로그, Logstash 전송)
+    implementation 'net.logstash.logback:logstash-logback-encoder:8.0'
+
+    // ========================================
+    // API Documentation - Swagger/OpenAPI
+    // ========================================
+    // SpringDoc OpenAPI (Swagger UI 자동 생성)
+    implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:2.8.4'
+
+    // ========================================
+    // Utilities
+    // ========================================
+    // Lombok (보일러플레이트 코드 자동 생성)
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+    // DevTools (개발 시 자동 재시작, 운영에서는 비활성화)
+    developmentOnly 'org.springframework.boot:spring-boot-devtools'
+
+    // ========================================
+    // Testing
+    // ========================================
+    // Spring Boot Test (JUnit 5, MockMvc, TestRestTemplate 등)
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    // Kafka Test (EmbeddedKafka 등)
+    testImplementation 'org.springframework.kafka:spring-kafka-test'
+    // H2 Database (인메모리 DB, 테스트용)
+    testRuntimeOnly 'com.h2database:h2'
+    // JUnit Platform Launcher
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    // Lombok for Test
+    testCompileOnly 'org.projectlombok:lombok'
+    testAnnotationProcessor 'org.projectlombok:lombok'
+}
+
+dependencyManagement {
+    imports {
+        mavenBom "org.springframework.cloud:spring-cloud-dependencies:${springCloudVersion}"
+    }
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
+// ========================================
+// QueryDSL 설정
+// ========================================
+// Q클래스 생성 경로
+def querydslDir = "${buildDir}/generated/querydsl"
+
+sourceSets {
+    main.java.srcDirs += querydslDir
+}
+
+clean {
+    delete file(querydslDir)
+}

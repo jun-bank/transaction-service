@@ -16,13 +16,6 @@ java {
 
 repositories {
     mavenCentral()
-    maven {
-        url = uri("https://maven.pkg.github.com/jun-bank/common-lib")
-        credentials {
-            username = System.getenv("GITHUB_ACTOR") ?: project.findProperty("gpr.user") ?: ""
-            password = System.getenv("GITHUB_TOKEN") ?: project.findProperty("gpr.key") ?: ""
-        }
-    }
 }
 
 ext {
@@ -34,7 +27,7 @@ dependencies {
     // ========================================
     // Common Library (공통 모듈)
     // ========================================
-    implementation 'com.jun-bank:common-lib:0.0.1-SNAPSHOT'
+    implementation 'io.github.jun-bank:common-lib:0.0.1'
     // ========================================
     // Spring Boot Core
     // ========================================

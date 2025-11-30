@@ -79,25 +79,25 @@
 // 2. 서버에서 키 확인
 @Service
 public class TransactionService {
-    
+
     public TransactionResult process(String idempotencyKey, TransactionRequest request) {
         // 키로 이전 처리 결과 조회
-        Optional<IdempotencyRecord> existing = 
-            idempotencyRepository.findByKey(idempotencyKey);
-        
+        Optional<IdempotencyRecord> existing =
+                idempotencyRepository.findByKey(idempotencyKey);
+
         if (existing.isPresent()) {
             // 이미 처리됨 → 저장된 결과 반환
             return existing.get().getResult();
         }
-        
+
         // 신규 요청 → 처리
         TransactionResult result = processTransaction(request);
-        
+
         // 결과 저장 (24시간 후 만료)
         idempotencyRepository.save(
-            new IdempotencyRecord(idempotencyKey, result, ttl)
+                new IdempotencyRecord(idempotencyKey, result, ttl)
         );
-        
+
         return result;
     }
 }
@@ -367,49 +367,84 @@ Content-Type: application/json
 ## 📂 패키지 구조
 
 ```
-com.junbank.transaction
+com.jun_bank.transaction_service
 ├── TransactionServiceApplication.java
-├── domain
-│   ├── entity
-│   │   ├── Transaction.java
-│   │   └── IdempotencyRecord.java
-│   ├── enums
-│   │   ├── TransactionType.java
-│   │   └── TransactionStatus.java
-│   └── repository
-│       ├── TransactionRepository.java
-│       └── IdempotencyRepository.java
-├── application
-│   ├── service
-│   │   ├── TransactionService.java
-│   │   └── IdempotencyService.java
-│   ├── dto
-│   │   ├── request
-│   │   │   ├── DepositRequest.java
-│   │   │   ├── WithdrawalRequest.java
-│   │   │   └── CancelRequest.java
-│   │   └── response
-│   │       ├── TransactionResponse.java
-│   │       └── TransactionListResponse.java
-│   └── exception
-│       ├── InsufficientBalanceException.java
-│       └── DuplicateTransactionException.java
-├── infrastructure
-│   ├── kafka
-│   │   └── TransactionEventProducer.java
-│   ├── feign
-│   │   └── AccountServiceClient.java
-│   ├── idempotency
-│   │   ├── IdempotencyAspect.java
-│   │   └── Idempotent.java  (커스텀 어노테이션)
-│   └── config
-│       ├── JpaConfig.java
-│       └── KafkaConfig.java
-└── presentation
-    ├── controller
-    │   └── TransactionController.java
-    └── advice
-        └── TransactionExceptionHandler.java
+├── global/                          # 전역 설정 레이어
+│   ├── config/                      # 설정 클래스
+│   │   ├── JpaConfig.java           # JPA Auditing 활성화
+│   │   ├── QueryDslConfig.java      # QueryDSL JPAQueryFactory 빈
+│   │   ├── KafkaProducerConfig.java # Kafka Producer (멱등성, JacksonJsonSerializer)
+│   │   ├── KafkaConsumerConfig.java # Kafka Consumer (수동 ACK, JacksonJsonDeserializer)
+│   │   ├── SecurityConfig.java      # Spring Security (헤더 기반 인증)
+│   │   ├── FeignConfig.java         # Feign Client 설정
+│   │   ├── SwaggerConfig.java       # OpenAPI 문서화
+│   │   └── AsyncConfig.java         # 비동기 처리 (ThreadPoolTaskExecutor)
+│   ├── infrastructure/
+│   │   ├── entity/
+│   │   │   └── BaseEntity.java      # 공통 엔티티 (Audit, Soft Delete)
+│   │   └── jpa/
+│   │       └── AuditorAwareImpl.java # JPA Auditing 사용자 정보
+│   ├── security/
+│   │   ├── UserPrincipal.java       # 인증 사용자 Principal
+│   │   ├── HeaderAuthenticationFilter.java # Gateway 헤더 인증 필터
+│   │   └── SecurityContextUtil.java # SecurityContext 유틸리티
+│   ├── feign/
+│   │   ├── FeignErrorDecoder.java   # Feign 에러 → BusinessException 변환
+│   │   └── FeignRequestInterceptor.java # 인증 헤더 전파
+│   └── aop/
+│       └── LoggingAspect.java       # 요청/응답 로깅 AOP
+└── domain/
+    └── transaction/                 # Transaction 도메인
+        ├── domain/                  # 순수 도메인 (Entity, VO, Enum)
+        ├── application/             # 유스케이스, Port, DTO
+        │   └── idempotency/         # 멱등성 처리 (추후 구현)
+        │       ├── Idempotent.java
+        │       └── IdempotencyAspect.java
+        ├── infrastructure/          # Adapter (Out) - Repository, Kafka
+        └── presentation/            # Adapter (In) - Controller
+```
+
+---
+
+## 🔧 Global 레이어 상세
+
+### Config 설정
+
+| 클래스 | 설명 |
+|--------|------|
+| `JpaConfig` | JPA Auditing 활성화 (`@EnableJpaAuditing`) |
+| `QueryDslConfig` | `JPAQueryFactory` 빈 등록 |
+| `KafkaProducerConfig` | 멱등성 Producer (ENABLE_IDEMPOTENCE=true, ACKS=all) |
+| `KafkaConsumerConfig` | 수동 ACK (MANUAL_IMMEDIATE), group-id: transaction-service-group |
+| `SecurityConfig` | Stateless 세션, 헤더 기반 인증, CSRF 비활성화 |
+| `FeignConfig` | 로깅 레벨 BASIC, 에러 디코더, 요청 인터셉터 |
+| `SwaggerConfig` | OpenAPI 3.0 문서화 설정 |
+| `AsyncConfig` | ThreadPoolTaskExecutor (core=5, max=10, queue=25) |
+
+### Security 설정
+
+| 클래스 | 설명 |
+|--------|------|
+| `HeaderAuthenticationFilter` | `X-User-Id`, `X-User-Role`, `X-User-Email` 헤더 → SecurityContext |
+| `UserPrincipal` | `UserDetails` 구현체, 인증된 사용자 정보 |
+| `SecurityContextUtil` | 현재 사용자 조회 유틸리티 |
+
+### BaseEntity (Soft Delete 지원)
+
+```java
+@MappedSuperclass
+public abstract class BaseEntity {
+    private LocalDateTime createdAt;      // 생성일시 (자동)
+    private LocalDateTime updatedAt;      // 수정일시 (자동)
+    private String createdBy;             // 생성자 (자동)
+    private String updatedBy;             // 수정자 (자동)
+    private LocalDateTime deletedAt;      // 삭제일시
+    private String deletedBy;             // 삭제자
+    private Boolean isDeleted = false;    // 삭제 여부
+    
+    public void delete(String deletedBy);  // Soft Delete
+    public void restore();                 // 복구
+}
 ```
 
 ---
@@ -454,24 +489,24 @@ public @interface Idempotent {
 @Aspect
 @Component
 public class IdempotencyAspect {
-    
+
     @Around("@annotation(idempotent)")
-    public Object checkIdempotency(ProceedingJoinPoint joinPoint, 
+    public Object checkIdempotency(ProceedingJoinPoint joinPoint,
                                    Idempotent idempotent) throws Throwable {
         String key = extractIdempotencyKey();
-        
+
         // 1. 기존 결과 조회
         Optional<IdempotencyRecord> existing = repository.findByKey(key);
         if (existing.isPresent()) {
             return existing.get().getResponse();
         }
-        
+
         // 2. 신규 처리
         Object result = joinPoint.proceed();
-        
+
         // 3. 결과 저장
         repository.save(new IdempotencyRecord(key, result, ttl));
-        
+
         return result;
     }
 }
@@ -488,16 +523,16 @@ void 동일한_멱등성키로_중복_요청시_동일_결과_반환() {
     // Given
     String idempotencyKey = UUID.randomUUID().toString();
     DepositRequest request = new DepositRequest("110-1234-5678-90", 100000);
-    
+
     // When: 같은 키로 3번 요청
     TransactionResponse result1 = transactionService.deposit(idempotencyKey, request);
     TransactionResponse result2 = transactionService.deposit(idempotencyKey, request);
     TransactionResponse result3 = transactionService.deposit(idempotencyKey, request);
-    
+
     // Then: 모두 동일한 결과
     assertThat(result1.getTransactionId()).isEqualTo(result2.getTransactionId());
     assertThat(result2.getTransactionId()).isEqualTo(result3.getTransactionId());
-    
+
     // And: 실제 입금은 한 번만 발생
     Account account = accountRepository.findByAccountNumber("110-1234-5678-90");
     assertThat(account.getBalance()).isEqualTo(initialBalance + 100000);  // 300000이 아닌 100000만 추가

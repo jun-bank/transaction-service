@@ -41,6 +41,14 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-aspectj'
 
     // ========================================
+    // Security
+    // ========================================
+    // Spring Security (인증/인가)
+    implementation 'org.springframework.boot:spring-boot-starter-security'
+    // Security Test
+    testImplementation 'org.springframework.security:spring-security-test'
+
+    // ========================================
     // Spring Cloud - MSA 인프라
     // ========================================
     // Config Client (Config Server에서 설정 로드)

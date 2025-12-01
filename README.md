@@ -25,146 +25,246 @@
 ┌─────────────────────────────────────────────────────────────┐
 │                    멱등성 없는 경우 (위험!)                   │
 ├─────────────────────────────────────────────────────────────┤
-│                                                             │
 │   Client                  Server                            │
-│     │                       │                               │
 │     │  1. 출금 50,000원      │                               │
-│     │ ────────────────────> │  2. 처리 완료                  │
-│     │                       │     (잔액: 100,000 → 50,000)   │
-│     │  3. 응답 전송          │                               │
-│     │ <──────── ❌ 네트워크 오류 (응답 유실)                  │
-│     │                       │                               │
-│     │  4. 응답 없음...재시도! │                               │
-│     │ ────────────────────> │  5. 또 처리됨!!                │
-│     │                       │     (잔액: 50,000 → 0)  💥     │
-│     │  6. 응답 수신          │                               │
-│     │ <──────────────────── │                               │
-│     │                       │                               │
+│     │ ────────────────────> │  2. 처리 완료 (잔액 50,000)    │
+│     │  3. 응답 ❌ 네트워크 오류                               │
+│     │  4. 재시도!            │  5. 또 처리됨!! (잔액 0) 💥   │
 │   ❌ 50,000원이 두 번 빠짐!                                   │
-│                                                             │
 └─────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────┐
 │                    멱등성 있는 경우 (안전!)                   │
 ├─────────────────────────────────────────────────────────────┤
-│                                                             │
 │   Client                  Server                            │
-│     │                       │                               │
-│     │  1. 출금 50,000원      │                               │
-│     │     (Key: abc-123)    │                               │
-│     │ ────────────────────> │  2. Key 확인: 신규            │
-│     │                       │     → 처리 완료                │
-│     │                       │     → Key 저장 (결과 포함)     │
-│     │  3. 응답 전송          │                               │
-│     │ <──────── ❌ 네트워크 오류                             │
-│     │                       │                               │
-│     │  4. 재시도 (같은 Key)  │                               │
-│     │     (Key: abc-123)    │                               │
-│     │ ────────────────────> │  5. Key 확인: 이미 존재!       │
-│     │                       │     → 저장된 결과 반환 ✓       │
-│     │  6. 응답 수신          │                               │
-│     │ <──────────────────── │                               │
-│     │                       │                               │
+│     │  1. 출금 (Key: abc)    │  2. Key 신규 → 처리 + 저장    │
+│     │  3. 응답 ❌ 오류        │                               │
+│     │  4. 재시도 (Key: abc)  │  5. Key 존재 → 저장된 결과 ✓  │
 │   ✅ 결과는 동일! (한 번만 처리됨)                            │
-│                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 2. Idempotency Key 구현 방법
+### 2. IdempotencyRecord 도메인 모델로 구현
 
-```java
-// 1. 클라이언트가 요청 시 고유 키 생성하여 헤더에 포함
-// Header: X-Idempotency-Key: uuid-1234-5678
-
-// 2. 서버에서 키 확인
-@Service
-public class TransactionService {
-
-    public TransactionResult process(String idempotencyKey, TransactionRequest request) {
-        // 키로 이전 처리 결과 조회
-        Optional<IdempotencyRecord> existing =
-                idempotencyRepository.findByKey(idempotencyKey);
-
-        if (existing.isPresent()) {
-            // 이미 처리됨 → 저장된 결과 반환
-            return existing.get().getResult();
-        }
-
-        // 신규 요청 → 처리
-        TransactionResult result = processTransaction(request);
-
-        // 결과 저장 (24시간 후 만료)
-        idempotencyRepository.save(
-                new IdempotencyRecord(idempotencyKey, result, ttl)
-        );
-
-        return result;
-    }
-}
 ```
-
-### 3. 거래 상태 관리
-- PENDING → SUCCESS / FAILED / CANCELLED
+┌─────────────────────────────────────────────────────────────┐
+│                    멱등성 처리 흐름                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│   1. 요청 수신 (X-Idempotency-Key 헤더)                     │
+│             │                                               │
+│             ▼                                               │
+│   2. IdempotencyRecord 조회                                 │
+│             │                                               │
+│      ┌──────┴──────┐                                        │
+│      │             │                                        │
+│   없음           있음                                        │
+│      │             │                                        │
+│      ▼             ▼                                        │
+│   3. IN_PROGRESS  4. 상태 확인                              │
+│      로 저장          │                                     │
+│      │          ┌────┴────┐                                │
+│      │          │         │                                │
+│      │     COMPLETED  IN_PROGRESS                          │
+│      │          │         │                                │
+│      │          ▼         ▼                                │
+│      │     저장된 응답   충돌 에러                           │
+│      │       반환         (409)                             │
+│      │                                                      │
+│      ▼                                                      │
+│   5. 비즈니스 로직 실행                                      │
+│             │                                               │
+│      ┌──────┴──────┐                                        │
+│      │             │                                        │
+│    성공          실패                                        │
+│      │             │                                        │
+│      ▼             ▼                                        │
+│   COMPLETED     FAILED                                      │
+│   + 응답 저장   + 에러 저장                                  │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## 🗄️ 도메인 모델
 
-### Transaction Entity
-
+### 도메인 구조
 ```
-┌─────────────────────────────────────────────┐
-│               Transaction                    │
-├─────────────────────────────────────────────┤
-│ id: Long (PK, Auto)                         │
-│ transactionId: String (UUID, Unique)        │
-│ accountId: Long (FK → Account)              │
-│ type: TransactionType (DEPOSIT/WITHDRAWAL)  │
-│ amount: BigDecimal                          │
-│ balanceAfter: BigDecimal (거래 후 잔액)      │
-│ status: TransactionStatus                   │
-│ description: String                         │
-│ idempotencyKey: String (Unique, Nullable)   │
-│ createdAt: LocalDateTime                    │
-│ processedAt: LocalDateTime                  │
-└─────────────────────────────────────────────┘
+domain/transaction/domain/
+├── exception/
+│   ├── TransactionErrorCode.java    # 에러 코드 정의
+│   └── TransactionException.java    # 도메인 예외
+└── model/
+    ├── Transaction.java             # 거래 Aggregate Root
+    ├── IdempotencyRecord.java       # 멱등성 레코드
+    ├── TransactionType.java         # 유형 Enum
+    ├── TransactionStatus.java       # 상태 Enum
+    └── vo/
+        ├── TransactionId.java       # TXN-xxxxxxxx
+        ├── IdempotencyKey.java      # 멱등성 키 (클라이언트 제공)
+        └── Money.java               # 금액 VO
 ```
 
-### IdempotencyRecord Entity
-
+### Transaction 도메인 모델
 ```
-┌─────────────────────────────────────────────┐
-│            IdempotencyRecord                 │
-├─────────────────────────────────────────────┤
-│ id: Long (PK, Auto)                         │
-│ idempotencyKey: String (Unique)             │
-│ requestHash: String (요청 내용 해시)         │
-│ responseBody: String (JSON 응답)             │
-│ httpStatus: Integer                         │
-│ createdAt: LocalDateTime                    │
-│ expiresAt: LocalDateTime (TTL)              │
-└─────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                       Transaction                            │
+├─────────────────────────────────────────────────────────────┤
+│ 【핵심 필드】                                                 │
+│ transactionId: TransactionId (PK, TXN-xxxxxxxx)             │
+│ accountId: String (계좌, ACC-xxx)                           │
+│ type: TransactionType (DEPOSIT/WITHDRAWAL/TRANSFER_IN...)   │
+│ amount: Money (거래 금액)                                    │
+│ balanceAfter: Money (거래 후 잔액, 완료 시 설정)             │
+│ status: TransactionStatus (PENDING/SUCCESS/FAILED/CANCELLED)│
+│ description: String (거래 설명)                             │
+│ idempotencyKey: IdempotencyKey (멱등성 키)                  │
+│ referenceTransactionId: String (환불 시 원거래 ID)          │
+│ failReason: String (실패 사유)                              │
+│ cancelReason: String (취소 사유)                            │
+│ processedAt: LocalDateTime (처리 완료 시간)                 │
+├─────────────────────────────────────────────────────────────┤
+│ 【감사 필드 - BaseEntity】                                    │
+│ createdAt, updatedAt, createdBy, updatedBy                  │
+│ deletedAt, deletedBy, isDeleted (Soft Delete)               │
+├─────────────────────────────────────────────────────────────┤
+│ 【비즈니스 메서드】                                           │
+│ + complete(Money balanceAfter): void  // 성공 처리           │
+│ + fail(String reason): void           // 실패 처리           │
+│ + cancel(String reason): void         // 취소 처리           │
+├─────────────────────────────────────────────────────────────┤
+│ 【상태 확인 메서드】                                          │
+│ + isPending(), isSuccess(), isFailed(), isCancelled()       │
+│ + isFinal(), canCancel()                                    │
+│ + isCredit(), isDebit()                                     │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### TransactionType Enum
+### IdempotencyRecord 도메인 모델
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    IdempotencyRecord                         │
+├─────────────────────────────────────────────────────────────┤
+│ 【필드】                                                      │
+│ idempotencyKey: IdempotencyKey (PK, 클라이언트 제공)        │
+│ requestHash: String (요청 해시, 충돌 감지용)                │
+│ responseBody: String (응답 JSON)                            │
+│ httpStatus: int                                             │
+│ transactionId: String (생성된 거래 ID)                      │
+│ status: IdempotencyStatus (IN_PROGRESS/COMPLETED/FAILED)    │
+│ createdAt, expiresAt: LocalDateTime (TTL 관리)              │
+├─────────────────────────────────────────────────────────────┤
+│ 【비즈니스 메서드】                                           │
+│ + complete(responseBody, httpStatus, transactionId)         │
+│ + fail(responseBody, httpStatus)                            │
+│ + validateRequestMatch(requestHash)  // 충돌 검증           │
+│ + validateNotExpired()               // 만료 검증           │
+│ + validateNotInProgress()            // 동시 요청 방지      │
+├─────────────────────────────────────────────────────────────┤
+│ 【상태 확인 메서드】                                          │
+│ + isExpired(), isInProgress(), isCompleted(), isValid()     │
+│ + matchesRequest(requestHash)                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### TransactionType Enum (거래 유형)
 ```java
 public enum TransactionType {
-    DEPOSIT,      // 입금
-    WITHDRAWAL,   // 출금
-    TRANSFER_IN,  // 이체 입금
-    TRANSFER_OUT, // 이체 출금
-    PAYMENT,      // 결제
-    REFUND        // 환불
+    DEPOSIT("입금", credit=true, code="DEP"),
+    WITHDRAWAL("출금", credit=false, code="WDR"),
+    TRANSFER_IN("이체입금", credit=true, code="TRI"),
+    TRANSFER_OUT("이체출금", credit=false, code="TRO"),
+    PAYMENT("결제", credit=false, code="PAY"),
+    REFUND("환불", credit=true, code="RFD"),
+    INTEREST("이자", credit=true, code="INT"),
+    FEE("수수료", credit=false, code="FEE");
+    
+    // 정책 메서드
+    public boolean isCredit();   // 입금(잔액+)
+    public boolean isDebit();    // 출금(잔액-)
+    public boolean isTransfer();
+    public boolean isCancellable();
+    public boolean isUserInitiated();
 }
 ```
 
-### TransactionStatus Enum
+### TransactionStatus Enum (상태 정책)
 ```java
 public enum TransactionStatus {
-    PENDING,    // 처리 중
-    SUCCESS,    // 성공
-    FAILED,     // 실패
-    CANCELLED   // 취소
+    PENDING("처리중", final=false, cancellable=true),
+    SUCCESS("성공", final=true, cancellable=false),
+    FAILED("실패", final=true, cancellable=false),
+    CANCELLED("취소", final=true, cancellable=false);
+    
+    // 정책 메서드
+    public boolean isFinal();
+    public boolean isCancellable();
+    public boolean canTransitionTo(target);
+}
+```
+
+**상태 전이 규칙:**
+```
+PENDING → SUCCESS (처리 성공)
+        → FAILED (처리 실패)
+        → CANCELLED (사용자/관리자 취소)
+SUCCESS, FAILED, CANCELLED → (최종 상태, 전이 불가)
+```
+
+### Value Objects
+
+#### IdempotencyKey (멱등성 키)
+```java
+public record IdempotencyKey(String value) {
+    // 클라이언트가 생성하여 X-Idempotency-Key 헤더로 전달
+    // 최소 8자, 최대 128자
+    // 영문자, 숫자, 하이픈, 언더스코어 허용
+    // UUID 형식 권장
+    
+    public static final long DEFAULT_TTL_SECONDS = 86400;  // 24시간
+    
+    public static IdempotencyKey fromHeader(String headerValue);
+    public static boolean isValid(String value);
+}
+```
+
+### Exception 체계
+
+#### TransactionErrorCode
+```java
+public enum TransactionErrorCode implements ErrorCode {
+    // 유효성 (400)
+    INVALID_TRANSACTION_ID_FORMAT, INVALID_AMOUNT,
+    IDEMPOTENCY_KEY_REQUIRED, INVALID_IDEMPOTENCY_KEY_FORMAT,
+    
+    // 조회 (404)
+    TRANSACTION_NOT_FOUND,
+    
+    // 잔액/한도 (400)
+    INSUFFICIENT_BALANCE, DAILY_LIMIT_EXCEEDED,
+    
+    // 상태 (422)
+    TRANSACTION_ALREADY_PROCESSED, TRANSACTION_ALREADY_CANCELLED,
+    CANNOT_CANCEL_TRANSACTION, INVALID_STATUS_TRANSITION,
+    
+    // 멱등성 (409)
+    IDEMPOTENCY_KEY_CONFLICT, IDEMPOTENCY_KEY_EXPIRED,
+    IDEMPOTENCY_KEY_IN_PROGRESS,
+    
+    // 계좌 (400)
+    ACCOUNT_NOT_FOUND, ACCOUNT_NOT_ACTIVE;
+}
+```
+
+#### TransactionException (팩토리 메서드)
+```java
+public class TransactionException extends BusinessException {
+    public static TransactionException transactionNotFound(String transactionId);
+    public static TransactionException insufficientBalance(BigDecimal current, BigDecimal requested);
+    public static TransactionException idempotencyKeyConflict(String key);
+    public static TransactionException idempotencyKeyInProgress(String key);
+    // ...
 }
 ```
 
@@ -175,9 +275,9 @@ public enum TransactionStatus {
 ### 1. 입금
 ```http
 POST /api/v1/transactions/deposit
-X-User-Id: 1
+X-User-Id: USR-a1b2c3d4
 X-User-Role: USER
-X-Idempotency-Key: deposit-uuid-12345
+X-Idempotency-Key: deposit-uuid-12345  ← 필수!
 Content-Type: application/json
 
 {
@@ -187,12 +287,12 @@ Content-Type: application/json
 }
 ```
 
-**Response (200 OK)**
+**Response (201 Created)**
 ```json
 {
-  "transactionId": "txn-uuid-abcd",
+  "transactionId": "TXN-a1b2c3d4",
+  "accountId": "ACC-12345678",
   "type": "DEPOSIT",
-  "accountNumber": "110-1234-5678-90",
   "amount": 100000,
   "balanceAfter": 250000,
   "status": "SUCCESS",
@@ -201,18 +301,16 @@ Content-Type: application/json
 }
 ```
 
-**멱등성 동작**: 같은 `X-Idempotency-Key`로 재요청 시 동일 응답 반환
-
-**이벤트 발행**: `transaction.deposit.completed`
-
----
+**멱등성 처리:**
+- 동일한 `X-Idempotency-Key`로 재요청 시 저장된 응답 반환
+- 24시간 후 키 만료
 
 ### 2. 출금
 ```http
 POST /api/v1/transactions/withdrawal
-X-User-Id: 1
+X-User-Id: USR-a1b2c3d4
 X-User-Role: USER
-X-Idempotency-Key: withdrawal-uuid-67890
+X-Idempotency-Key: withdrawal-uuid-67890  ← 필수!
 Content-Type: application/json
 
 {
@@ -222,12 +320,12 @@ Content-Type: application/json
 }
 ```
 
-**Response (200 OK)**
+**Response (201 Created)**
 ```json
 {
-  "transactionId": "txn-uuid-efgh",
+  "transactionId": "TXN-e5f6g7h8",
+  "accountId": "ACC-12345678",
   "type": "WITHDRAWAL",
-  "accountNumber": "110-1234-5678-90",
   "amount": 50000,
   "balanceAfter": 200000,
   "status": "SUCCESS",
@@ -236,57 +334,23 @@ Content-Type: application/json
 }
 ```
 
-**잔액 부족 시 (400 Bad Request)**
-```json
-{
-  "error": "INSUFFICIENT_BALANCE",
-  "message": "잔액이 부족합니다.",
-  "currentBalance": 30000,
-  "requestedAmount": 50000
-}
-```
+**도메인 검증:**
+- `balance >= amount` 확인 (잔액 부족 → 400)
+- `dailyUsed + amount <= dailyLimit` 확인 (한도 초과 → 400)
 
-**이벤트 발행**: `transaction.withdrawal.completed`
-
----
-
-### 3. 거래 내역 조회 (단건)
+### 3. 거래 내역 조회
 ```http
-GET /api/v1/transactions/{transactionId}
-X-User-Id: 1
+GET /api/v1/transactions?accountNumber=110-1234-5678-90&page=0&size=20
+X-User-Id: USR-a1b2c3d4
 X-User-Role: USER
 ```
 
 **Response (200 OK)**
 ```json
 {
-  "transactionId": "txn-uuid-abcd",
-  "type": "DEPOSIT",
-  "accountNumber": "110-1234-5678-90",
-  "amount": 100000,
-  "balanceAfter": 250000,
-  "status": "SUCCESS",
-  "description": "급여 입금",
-  "createdAt": "2024-01-15T10:30:00",
-  "processedAt": "2024-01-15T10:30:01"
-}
-```
-
----
-
-### 4. 거래 내역 목록 조회
-```http
-GET /api/v1/transactions?accountNumber=110-1234-5678-90&type=DEPOSIT&page=0&size=20
-X-User-Id: 1
-X-User-Role: USER
-```
-
-**Response (200 OK)**
-```json
-{
-  "content": [
+  "transactions": [
     {
-      "transactionId": "txn-uuid-abcd",
+      "transactionId": "TXN-a1b2c3d4",
       "type": "DEPOSIT",
       "amount": 100000,
       "balanceAfter": 250000,
@@ -295,70 +359,39 @@ X-User-Role: USER
       "processedAt": "2024-01-15T10:30:00"
     },
     {
-      "transactionId": "txn-uuid-ijkl",
-      "type": "DEPOSIT",
+      "transactionId": "TXN-e5f6g7h8",
+      "type": "WITHDRAWAL",
       "amount": 50000,
-      "balanceAfter": 150000,
+      "balanceAfter": 200000,
       "status": "SUCCESS",
-      "description": "용돈",
-      "processedAt": "2024-01-14T15:00:00"
+      "description": "ATM 출금",
+      "processedAt": "2024-01-15T11:00:00"
     }
   ],
   "page": 0,
   "size": 20,
-  "totalElements": 45,
-  "totalPages": 3
+  "totalElements": 100
 }
 ```
 
----
-
-### 5. 기간별 거래 내역 조회
-```http
-GET /api/v1/transactions/period?accountNumber=110-1234-5678-90&startDate=2024-01-01&endDate=2024-01-31
-X-User-Id: 1
-X-User-Role: USER
-```
-
-**Response (200 OK)**
-```json
-{
-  "accountNumber": "110-1234-5678-90",
-  "period": {
-    "start": "2024-01-01",
-    "end": "2024-01-31"
-  },
-  "summary": {
-    "totalDeposit": 500000,
-    "totalWithdrawal": 200000,
-    "netChange": 300000,
-    "transactionCount": 15
-  },
-  "transactions": [...]
-}
-```
-
----
-
-### 6. 거래 취소 (관리자)
+### 4. 거래 취소
 ```http
 POST /api/v1/transactions/{transactionId}/cancel
-X-User-Id: 999
-X-User-Role: ADMIN
-Content-Type: application/json
+X-User-Id: USR-a1b2c3d4
+X-User-Role: USER
 
 {
-  "reason": "고객 요청에 의한 취소"
+  "reason": "고객 요청 취소"
 }
 ```
 
 **Response (200 OK)**
 ```json
 {
-  "transactionId": "txn-uuid-abcd",
+  "transactionId": "TXN-e5f6g7h8",
   "status": "CANCELLED",
-  "cancelledAt": "2024-01-15T12:00:00",
-  "reason": "고객 요청에 의한 취소"
+  "cancelReason": "고객 요청 취소",
+  "cancelledAt": "2024-01-15T11:30:00"
 }
 ```
 
@@ -369,39 +402,63 @@ Content-Type: application/json
 ```
 com.jun_bank.transaction_service
 ├── TransactionServiceApplication.java
-├── global/                          # 전역 설정 레이어
-│   ├── config/                      # 설정 클래스
-│   │   ├── JpaConfig.java           # JPA Auditing 활성화
-│   │   ├── QueryDslConfig.java      # QueryDSL JPAQueryFactory 빈
-│   │   ├── KafkaProducerConfig.java # Kafka Producer (멱등성, JacksonJsonSerializer)
-│   │   ├── KafkaConsumerConfig.java # Kafka Consumer (수동 ACK, JacksonJsonDeserializer)
-│   │   ├── SecurityConfig.java      # Spring Security (헤더 기반 인증)
-│   │   ├── FeignConfig.java         # Feign Client 설정
-│   │   ├── SwaggerConfig.java       # OpenAPI 문서화
-│   │   └── AsyncConfig.java         # 비동기 처리 (ThreadPoolTaskExecutor)
+├── global/                              # 전역 설정 레이어
+│   ├── config/                          # 설정 클래스
+│   │   ├── JpaConfig.java               # JPA Auditing 활성화
+│   │   ├── QueryDslConfig.java          # QueryDSL JPAQueryFactory 빈
+│   │   ├── KafkaProducerConfig.java     # Kafka Producer (멱등성, JacksonJsonSerializer)
+│   │   ├── KafkaConsumerConfig.java     # Kafka Consumer (수동 ACK, JacksonJsonDeserializer)
+│   │   ├── SecurityConfig.java          # Spring Security (헤더 기반 인증)
+│   │   ├── FeignConfig.java             # Feign Client 설정
+│   │   ├── SwaggerConfig.java           # OpenAPI 문서화
+│   │   └── AsyncConfig.java             # 비동기 처리 (ThreadPoolTaskExecutor)
 │   ├── infrastructure/
 │   │   ├── entity/
-│   │   │   └── BaseEntity.java      # 공통 엔티티 (Audit, Soft Delete)
+│   │   │   └── BaseEntity.java          # 공통 엔티티 (Audit, Soft Delete)
 │   │   └── jpa/
-│   │       └── AuditorAwareImpl.java # JPA Auditing 사용자 정보
+│   │       └── AuditorAwareImpl.java    # JPA Auditing 사용자 정보
 │   ├── security/
-│   │   ├── UserPrincipal.java       # 인증 사용자 Principal
+│   │   ├── UserPrincipal.java           # 인증 사용자 Principal
 │   │   ├── HeaderAuthenticationFilter.java # Gateway 헤더 인증 필터
-│   │   └── SecurityContextUtil.java # SecurityContext 유틸리티
+│   │   └── SecurityContextUtil.java     # SecurityContext 유틸리티
 │   ├── feign/
-│   │   ├── FeignErrorDecoder.java   # Feign 에러 → BusinessException 변환
+│   │   ├── FeignErrorDecoder.java       # Feign 에러 → BusinessException 변환
 │   │   └── FeignRequestInterceptor.java # 인증 헤더 전파
 │   └── aop/
-│       └── LoggingAspect.java       # 요청/응답 로깅 AOP
+│       └── LoggingAspect.java           # 요청/응답 로깅 AOP
 └── domain/
-    └── transaction/                 # Transaction 도메인
-        ├── domain/                  # 순수 도메인 (Entity, VO, Enum)
-        ├── application/             # 유스케이스, Port, DTO
-        │   └── idempotency/         # 멱등성 처리 (추후 구현)
-        │       ├── Idempotent.java
+    └── transaction/                     # Transaction Bounded Context
+        ├── domain/                      # 순수 도메인 ★ 구현 완료
+        │   ├── exception/
+        │   │   ├── TransactionErrorCode.java
+        │   │   └── TransactionException.java
+        │   └── model/
+        │       ├── Transaction.java          # Aggregate Root
+        │       ├── IdempotencyRecord.java    # 멱등성 레코드
+        │       ├── TransactionType.java      # 유형 (정책)
+        │       ├── TransactionStatus.java    # 상태 (정책)
+        │       └── vo/
+        │           ├── TransactionId.java
+        │           ├── IdempotencyKey.java
+        │           └── Money.java
+        ├── application/                 # 유스케이스 (TODO)
+        │   ├── port/
+        │   │   ├── in/
+        │   │   └── out/
+        │   ├── service/
+        │   ├── dto/
+        │   └── idempotency/             # 멱등성 AOP
+        │       ├── Idempotent.java      # 어노테이션
         │       └── IdempotencyAspect.java
-        ├── infrastructure/          # Adapter (Out) - Repository, Kafka
-        └── presentation/            # Adapter (In) - Controller
+        ├── infrastructure/              # Adapter Out (TODO)
+        │   ├── persistence/
+        │   │   ├── entity/              # JPA Entity
+        │   │   ├── repository/
+        │   │   └── adapter/
+        │   └── kafka/
+        └── presentation/                # Adapter In (TODO)
+            ├── controller/
+            └── dto/
 ```
 
 ---
@@ -454,9 +511,10 @@ public abstract class BaseEntity {
 ### 발행 이벤트 (Kafka Producer)
 | 이벤트 | 토픽 | 수신 서비스 | 설명 |
 |--------|------|-------------|------|
-| DEPOSIT_COMPLETED | transaction.deposit.completed | Ledger | 입금 기록 |
-| WITHDRAWAL_COMPLETED | transaction.withdrawal.completed | Ledger | 출금 기록 |
-| TRANSACTION_FAILED | transaction.failed | Ledger | 실패 기록 |
+| DEPOSIT_COMPLETED | transaction.deposit.completed | Ledger | 입금 완료 기록 |
+| WITHDRAWAL_COMPLETED | transaction.withdrawal.completed | Ledger | 출금 완료 기록 |
+| TRANSACTION_FAILED | transaction.failed | Ledger | 거래 실패 기록 |
+| TRANSACTION_CANCELLED | transaction.cancelled | Ledger | 거래 취소 기록 |
 
 ### Feign Client 호출
 | 대상 서비스 | 용도 | 비고 |
@@ -465,124 +523,116 @@ public abstract class BaseEntity {
 
 ---
 
-## ⚙️ 멱등성 설정
-
-### application.yml
-```yaml
-transaction-service:
-  idempotency-key-ttl: 86400  # 24시간
-  idempotency-key-header: X-Idempotency-Key
-```
-
-### 커스텀 어노테이션
-```java
-@Target(ElementType.METHOD)
-@Retention(RetentionPolicy.RUNTIME)
-public @interface Idempotent {
-    String keyHeader() default "X-Idempotency-Key";
-    long ttlSeconds() default 86400;
-}
-```
-
-### AOP 적용
-```java
-@Aspect
-@Component
-public class IdempotencyAspect {
-
-    @Around("@annotation(idempotent)")
-    public Object checkIdempotency(ProceedingJoinPoint joinPoint,
-                                   Idempotent idempotent) throws Throwable {
-        String key = extractIdempotencyKey();
-
-        // 1. 기존 결과 조회
-        Optional<IdempotencyRecord> existing = repository.findByKey(key);
-        if (existing.isPresent()) {
-            return existing.get().getResponse();
-        }
-
-        // 2. 신규 처리
-        Object result = joinPoint.proceed();
-
-        // 3. 결과 저장
-        repository.save(new IdempotencyRecord(key, result, ttl));
-
-        return result;
-    }
-}
-```
-
----
-
 ## 🧪 테스트 시나리오
 
-### 1. 멱등성 테스트
+### 1. 멱등성 테스트 - 동일 키 재요청
 ```java
 @Test
-void 동일한_멱등성키로_중복_요청시_동일_결과_반환() {
-    // Given
-    String idempotencyKey = UUID.randomUUID().toString();
-    DepositRequest request = new DepositRequest("110-1234-5678-90", 100000);
-
-    // When: 같은 키로 3번 요청
-    TransactionResponse result1 = transactionService.deposit(idempotencyKey, request);
-    TransactionResponse result2 = transactionService.deposit(idempotencyKey, request);
-    TransactionResponse result3 = transactionService.deposit(idempotencyKey, request);
-
-    // Then: 모두 동일한 결과
-    assertThat(result1.getTransactionId()).isEqualTo(result2.getTransactionId());
-    assertThat(result2.getTransactionId()).isEqualTo(result3.getTransactionId());
-
-    // And: 실제 입금은 한 번만 발생
-    Account account = accountRepository.findByAccountNumber("110-1234-5678-90");
-    assertThat(account.getBalance()).isEqualTo(initialBalance + 100000);  // 300000이 아닌 100000만 추가
+void 동일_키로_재요청시_저장된_응답_반환() {
+    // Given: 첫 번째 입금 요청
+    String idempotencyKey = "test-key-12345";
+    
+    // When: 같은 키로 재요청
+    
+    // Then:
+    // 1. 두 번째 요청에도 동일한 응답 반환
+    // 2. 잔액은 한 번만 증가
+    // 3. 거래 기록도 1건만 생성
 }
 ```
 
-### 2. API 테스트
-```bash
-# 입금 (첫 번째 요청)
-curl -X POST http://localhost:8080/api/v1/transactions/deposit \
-  -H "Content-Type: application/json" \
-  -H "X-User-Id: 1" \
-  -H "X-User-Role: USER" \
-  -H "X-Idempotency-Key: test-key-123" \
-  -d '{"accountNumber":"110-1234-5678-90","amount":100000}'
-
-# 입금 (동일 키로 재요청 - 같은 결과 반환되어야 함)
-curl -X POST http://localhost:8080/api/v1/transactions/deposit \
-  -H "Content-Type: application/json" \
-  -H "X-User-Id: 1" \
-  -H "X-User-Role: USER" \
-  -H "X-Idempotency-Key: test-key-123" \
-  -d '{"accountNumber":"110-1234-5678-90","amount":100000}'
+### 2. 멱등성 테스트 - 키 충돌
+```java
+@Test
+void 같은_키_다른_요청시_충돌_에러() {
+    // Given: 첫 번째 요청 (50,000원 입금)
+    String idempotencyKey = "test-key-12345";
+    
+    // When: 같은 키로 다른 요청 (100,000원 입금)
+    
+    // Then: IDEMPOTENCY_KEY_CONFLICT (409) 에러
+}
 ```
 
-### 3. 멱등성 키 없이 요청 (경고 또는 거부)
-```bash
-# X-Idempotency-Key 헤더 없이 요청
-curl -X POST http://localhost:8080/api/v1/transactions/deposit \
-  -H "Content-Type: application/json" \
-  -H "X-User-Id: 1" \
-  -H "X-User-Role: USER" \
-  -d '{"accountNumber":"110-1234-5678-90","amount":100000}'
+### 3. 동시 요청 테스트
+```java
+@Test
+void 동시_요청시_하나만_처리() {
+    // Given: 같은 멱등성 키로 동시에 2개 요청
+    
+    // When: 동시 실행
+    
+    // Then:
+    // 1. 하나는 정상 처리 (201)
+    // 2. 다른 하나는 IN_PROGRESS 에러 (409) 또는 저장된 응답 반환
+}
+```
 
-# 응답: 400 Bad Request (또는 경고와 함께 처리)
+### 4. API 테스트
+```bash
+# 입금 요청
+curl -X POST http://localhost:8082/api/v1/transactions/deposit \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: USR-xxx" \
+  -H "X-User-Role: USER" \
+  -H "X-Idempotency-Key: deposit-12345" \
+  -d '{"accountNumber":"110-1234-5678-90","amount":100000,"description":"급여"}'
+
+# 출금 요청
+curl -X POST http://localhost:8082/api/v1/transactions/withdrawal \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: USR-xxx" \
+  -H "X-User-Role: USER" \
+  -H "X-Idempotency-Key: withdrawal-67890" \
+  -d '{"accountNumber":"110-1234-5678-90","amount":50000}'
+
+# 거래 내역 조회
+curl "http://localhost:8082/api/v1/transactions?accountNumber=110-1234-5678-90" \
+  -H "X-User-Id: USR-xxx" \
+  -H "X-User-Role: USER"
 ```
 
 ---
 
 ## 📝 구현 체크리스트
 
-- [ ] Entity, Repository 생성
-- [ ] TransactionService 구현
-- [ ] **IdempotencyService 구현**
-- [ ] **Idempotent 어노테이션 생성**
-- [ ] **IdempotencyAspect 구현**
-- [ ] Controller 구현
-- [ ] Kafka Producer 구현
-- [ ] Feign Client 구현 (Account Service)
-- [ ] **멱등성 테스트 코드**
-- [ ] 단위 테스트
-- [ ] 통합 테스트
-- [ ] API 문서화 (Swagger)
+### Domain Layer ✅
+- [x] TransactionErrorCode
+- [x] TransactionException
+- [x] TransactionType (정책 메서드)
+- [x] TransactionStatus (정책 메서드)
+- [x] TransactionId VO
+- [x] IdempotencyKey VO
+- [x] Money VO
+- [x] Transaction (Aggregate Root)
+- [x] IdempotencyRecord (멱등성 관리)
+
+### Application Layer
+- [ ] DepositUseCase
+- [ ] WithdrawUseCase
+- [ ] GetTransactionUseCase
+- [ ] CancelTransactionUseCase
+- [ ] TransactionPort
+- [ ] IdempotencyPort
+- [ ] @Idempotent 어노테이션
+- [ ] IdempotencyAspect
+- [ ] DTO 정의
+
+### Infrastructure Layer
+- [ ] TransactionEntity
+- [ ] IdempotencyRecordEntity
+- [ ] JpaRepository
+- [ ] TransactionKafkaProducer
+- [ ] AccountFeignClient
+
+### Presentation Layer
+- [ ] TransactionController
+- [ ] Request/Response DTO
+- [ ] Swagger 문서화
+
+### 테스트
+- [ ] 도메인 단위 테스트
+- [ ] 멱등성 테스트 (동일 키 재요청)
+- [ ] 키 충돌 테스트 (같은 키, 다른 요청)
+- [ ] 동시 요청 테스트
+- [ ] API 통합 테스트
